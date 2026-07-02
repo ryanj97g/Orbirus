@@ -1,2 +1,4 @@
 /target
-.claude/settings.local.json
+
+# Claude Code metadata (local-only, never pushed)
+.claude/
