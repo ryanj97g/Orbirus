@@ -1,6 +1,7 @@
-// Orbirus — M0 skeleton: DPI awareness, COM init, tray icon with Exit, message loop.
-// NOTE: #![windows_subsystem = "windows"] is intentionally absent until M7 —
-// keep the console during development for println! debugging.
+// Orbirus — a Fences-style desktop organizer in native Rust + Win32.
+// Release builds suppress the console (M7); debug builds keep it so
+// println! diagnostics stay visible during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
 mod desktop;
@@ -12,7 +13,8 @@ mod render;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -28,6 +30,8 @@ const IDM_EXIT: usize = 1;
 const IDM_NEW_FENCE: usize = 2;
 const IDM_SETTINGS: usize = 3;
 const TRAY_UID: u32 = 1;
+// Debounces watcher bursts (Explorer fires several events per operation).
+const TIMER_REFRESH: usize = 2;
 
 fn main() -> Result<()> {
     unsafe {
@@ -76,11 +80,31 @@ fn main() -> Result<()> {
         };
         config::init(cfg, hwnd);
 
+        // M7: fences that would restore entirely offscreen (monitor removed
+        // or rearranged) get pulled back onto the primary monitor, staggered.
+        let rescued = config::with(|cfg| {
+            let mut changed = false;
+            for (i, f) in cfg.fences.iter_mut().enumerate() {
+                let rc = RECT {
+                    left: f.x,
+                    top: f.y,
+                    right: f.x + f.w,
+                    bottom: f.y + f.h,
+                };
+                if MonitorFromRect(&rc, MONITOR_DEFAULTTONULL).is_invalid() {
+                    f.x = 100 + i as i32 * 40;
+                    f.y = 80 + i as i32 * 40;
+                    changed = true;
+                }
+            }
+            changed
+        });
+
         // M4: everything on the real Desktop folders appears exactly once;
         // unassigned items land in "Unsorted".
         let desktop_items = desktop::enumerate();
-        let changed = desktop::reconcile(&desktop_items);
-        if first_run || changed {
+        let (changed, _) = desktop::refresh(&desktop_items);
+        if first_run || changed || rescued {
             config::save_now();
         }
         println!("Desktop items: {}", desktop_items.len());
@@ -100,6 +124,9 @@ fn main() -> Result<()> {
         }
         println!("Loaded {} fence(s) from config.", fence_cfgs.len());
 
+        // M7: live updates from the real Desktop folders.
+        desktop::start_watcher(hwnd);
+
         if first_run {
             MessageBoxW(
                 hwnd,
@@ -113,6 +140,11 @@ fn main() -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
+            // Give the rename dialog standard Enter/Esc/Tab handling.
+            let dlg = fence::rename_dialog_hwnd();
+            if !dlg.0.is_null() && IsDialogMessageW(dlg, &msg).as_bool() {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -120,6 +152,35 @@ fn main() -> Result<()> {
         CoUninitialize();
         Ok(())
     }
+}
+
+/// Desktop folder changed: re-enumerate, diff into config, cache icons for
+/// arrivals, give any fence created by the diff (a fresh "Unsorted") a
+/// window, and repaint.
+unsafe fn on_desktop_changed(hwnd: HWND) {
+    let items = desktop::enumerate();
+    let (changed, added) = desktop::refresh(&items);
+    if !changed {
+        return;
+    }
+    config::schedule_save();
+    if !added.is_empty() {
+        let icon_px = config::with(|c| c.icon_size) * GetDpiForWindow(hwnd) / 96;
+        icons::preload(&added, icon_px);
+    }
+    let missing: Vec<config::FenceConfig> = config::with(|c| {
+        c.fences
+            .iter()
+            .filter(|f| fence::hwnd_for(&f.id).is_none())
+            .cloned()
+            .collect()
+    });
+    if let Ok(hmodule) = GetModuleHandleW(None) {
+        for fc in &missing {
+            let _ = fence::create_fence(hmodule.into(), fc);
+        }
+    }
+    fence::invalidate_all();
 }
 
 /// Tray "New Fence": a 300x200 fence centered on the cursor's monitor.
@@ -222,10 +283,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_TIMER => {
-                if wparam.0 == config::SAVE_TIMER_ID {
-                    let _ = KillTimer(hwnd, config::SAVE_TIMER_ID);
-                    config::save_now();
+                match wparam.0 {
+                    config::SAVE_TIMER_ID => {
+                        let _ = KillTimer(hwnd, config::SAVE_TIMER_ID);
+                        config::save_now();
+                    }
+                    TIMER_REFRESH => {
+                        let _ = KillTimer(hwnd, TIMER_REFRESH);
+                        on_desktop_changed(hwnd);
+                    }
+                    _ => {}
                 }
+                LRESULT(0)
+            }
+            desktop::WM_DESKTOP_CHANGED => {
+                // Coalesce event bursts; the timer does the real work.
+                SetTimer(hwnd, TIMER_REFRESH, 300, None);
                 LRESULT(0)
             }
             WM_DESTROY => {
