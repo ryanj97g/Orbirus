@@ -37,6 +37,7 @@ const MIN_FENCE_WIDTH: i32 = 120;
 
 const IDM_FENCE_DELETE: usize = 100;
 const IDM_FENCE_RENAME: usize = 101;
+const IDM_FENCE_AUTOORG: usize = 102;
 const IDM_COLOR_BASE: usize = 110; // ..117
 const IDM_OPACITY_BASE: usize = 120; // ..123
 const IDM_RADIUS_BASE: usize = 130; // ..133
@@ -454,6 +455,7 @@ unsafe fn show_fence_menu(hwnd: HWND) {
 
     let Ok(menu) = CreatePopupMenu() else { return };
     let _ = AppendMenuW(menu, MF_STRING, IDM_FENCE_RENAME, w!("Rename"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_FENCE_AUTOORG, w!("Auto-organize…"));
 
     let checked = |on: bool| if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
     if let Ok(color_menu) = CreatePopupMenu() {
@@ -517,6 +519,7 @@ unsafe fn show_fence_menu(hwnd: HWND) {
     match cmd {
         IDM_FENCE_DELETE => delete_fence(hwnd),
         IDM_FENCE_RENAME => open_rename_dialog(hwnd),
+        IDM_FENCE_AUTOORG => crate::rules_ui::open(hwnd, &state.id),
         c if (IDM_COLOR_BASE..IDM_COLOR_BASE + PALETTE.len()).contains(&c) => {
             set_fence_color(hwnd, PALETTE[c - IDM_COLOR_BASE].1);
         }

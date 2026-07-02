@@ -81,14 +81,30 @@ pub fn refresh(items: &[PathBuf]) -> (bool, Vec<String>) {
             .iter()
             .flat_map(|f| f.items.iter().map(|s| s.to_lowercase()))
             .collect();
-        let added: Vec<String> = items
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .filter(|s| !assigned.contains(&s.to_lowercase()))
-            .collect();
-        if !added.is_empty() {
-            let unsorted = config::ensure_unsorted(cfg);
-            cfg.fences[unsorted].items.extend(added.iter().cloned());
+        // M8: new arrivals are tested against the rules first (first match
+        // wins, fences in config order); no match falls back to Unsorted.
+        // Already-assigned items are never re-sorted.
+        let added_with_targets: Vec<(String, Option<String>)> = {
+            let cfg_ref = &*cfg;
+            items
+                .iter()
+                .filter(|p| !assigned.contains(&p.to_string_lossy().to_lowercase()))
+                .map(|p| {
+                    (
+                        p.to_string_lossy().into_owned(),
+                        crate::rules::match_fence(p, cfg_ref),
+                    )
+                })
+                .collect()
+        };
+        let mut added = Vec::new();
+        for (path, target) in added_with_targets {
+            let idx = match target.and_then(|id| cfg.fences.iter().position(|f| f.id == id)) {
+                Some(i) => i,
+                None => config::ensure_unsorted(cfg),
+            };
+            cfg.fences[idx].items.push(path.clone());
+            added.push(path);
             changed = true;
         }
         (changed, added)

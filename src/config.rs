@@ -29,6 +29,9 @@ pub struct FenceConfig {
     pub opacity: f32,
     pub corner_radius: f32,
     pub items: Vec<String>,
+    // v2 (M8): auto-organize rules. Default keeps v1 configs loading.
+    #[serde(default)]
+    pub rules: Vec<crate::rules::Rule>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,7 +44,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            version: 1,
+            version: 2,
             icon_size: 48,
             fences: vec![FenceConfig {
                 id: "fence-1".to_string(),
@@ -56,6 +59,7 @@ impl Default for Config {
                 opacity: 0.78,
                 corner_radius: 12.0,
                 items: Vec::new(),
+                rules: Vec::new(),
             }],
         }
     }
@@ -94,6 +98,7 @@ pub fn ensure_unsorted(cfg: &mut Config) -> usize {
         opacity: 0.78,
         corner_radius: 12.0,
         items: Vec::new(),
+        rules: Vec::new(),
     });
     cfg.fences.len() - 1
 }
@@ -121,8 +126,14 @@ pub fn load() -> LoadResult {
         Ok(t) => t,
         Err(_) => return LoadResult::Missing,
     };
-    match serde_json::from_str::<Config>(&text) {
+    // Tolerate a UTF-8 BOM: external editors (invited via Settings…) may
+    // prepend one, and serde_json rejects it.
+    let text = text.trim_start_matches('\u{feff}');
+    match serde_json::from_str::<Config>(text) {
         Ok(mut cfg) => {
+            // v1 -> v2 migration (M8): serde's default already gave every
+            // fence an empty rules array; just stamp the version.
+            cfg.version = 2;
             // Items that vanished from disk are silently dropped (§5).
             for f in &mut cfg.fences {
                 f.items.retain(|p| Path::new(p).exists());

@@ -9,6 +9,8 @@ mod fence;
 mod icons;
 mod launch;
 mod render;
+mod rules;
+mod rules_ui;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -29,6 +31,7 @@ const WM_TRAYICON: u32 = WM_APP + 2;
 const IDM_EXIT: usize = 1;
 const IDM_NEW_FENCE: usize = 2;
 const IDM_SETTINGS: usize = 3;
+const IDM_SORT_UNSORTED: usize = 4;
 const TRAY_UID: u32 = 1;
 // Debounces watcher bursts (Explorer fires several events per operation).
 const TIMER_REFRESH: usize = 2;
@@ -118,6 +121,7 @@ fn main() -> Result<()> {
         println!("Cached icons for {} item(s).", all_items.len());
 
         fence::register_class(hinstance)?;
+        rules_ui::register_class(hinstance)?;
         let fence_cfgs = config::with(|c| c.fences.clone());
         for fc in &fence_cfgs {
             fence::create_fence(hinstance, fc)?;
@@ -140,9 +144,11 @@ fn main() -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
-            // Give the rename dialog standard Enter/Esc/Tab handling.
-            let dlg = fence::rename_dialog_hwnd();
-            if !dlg.0.is_null() && IsDialogMessageW(dlg, &msg).as_bool() {
+            // Give our dialogs standard Enter/Esc/Tab handling.
+            let handled = [fence::rename_dialog_hwnd(), rules_ui::dialog_hwnd()]
+                .into_iter()
+                .any(|d| !d.0.is_null() && IsDialogMessageW(d, &msg).as_bool());
+            if handled {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -183,6 +189,60 @@ unsafe fn on_desktop_changed(hwnd: HWND) {
     fence::invalidate_all();
 }
 
+/// Tray "Sort Unsorted now" (M8): run all rules against everything in
+/// Unsorted; confirm before moving. Manual placements elsewhere are never
+/// touched.
+unsafe fn sort_unsorted_now(hwnd: HWND) {
+    let moves: Vec<(String, String)> = config::with(|cfg| {
+        let Some(u) = cfg.fences.iter().position(|f| f.title == "Unsorted") else {
+            return Vec::new();
+        };
+        let uid = cfg.fences[u].id.clone();
+        let items = cfg.fences[u].items.clone();
+        let cfg_ref = &*cfg;
+        items
+            .into_iter()
+            .filter_map(|item| {
+                rules::match_fence(std::path::Path::new(&item), cfg_ref)
+                    .filter(|target| *target != uid)
+                    .map(|target| (item, target))
+            })
+            .collect()
+    });
+    if moves.is_empty() {
+        MessageBoxW(
+            hwnd,
+            w!("Nothing in Unsorted matches any rule."),
+            w!("Orbirus"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
+    let text: Vec<u16> = format!("This will move {} items. Continue?", moves.len())
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let answer = MessageBoxW(hwnd, PCWSTR(text.as_ptr()), w!("Orbirus"), MB_YESNO | MB_ICONQUESTION);
+    if answer != IDYES {
+        return;
+    }
+    config::with(|cfg| {
+        for (item, target_id) in &moves {
+            let Some(u) = cfg.fences.iter().position(|f| f.title == "Unsorted") else {
+                return;
+            };
+            if let Some(pos) = cfg.fences[u].items.iter().position(|p| p == item) {
+                let it = cfg.fences[u].items.remove(pos);
+                if let Some(t) = cfg.fences.iter_mut().find(|f| f.id == *target_id) {
+                    t.items.push(it);
+                }
+            }
+        }
+    });
+    config::schedule_save();
+    fence::invalidate_all();
+}
+
 /// Tray "New Fence": a 300x200 fence centered on the cursor's monitor.
 unsafe fn create_new_fence() {
     let Ok(hmodule) = GetModuleHandleW(None) else {
@@ -209,6 +269,7 @@ unsafe fn create_new_fence() {
         opacity: 0.78,
         corner_radius: 12.0,
         items: Vec::new(),
+        rules: Vec::new(),
     };
     config::with(|c| c.fences.push(fc.clone()));
     config::schedule_save();
@@ -249,6 +310,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         return;
     };
     let _ = AppendMenuW(menu, MF_STRING, IDM_NEW_FENCE, w!("New Fence"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_SORT_UNSORTED, w!("Sort Unsorted now"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, w!("Settings…"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
 
@@ -277,6 +339,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         let _ = DestroyWindow(hwnd);
                     }
                     IDM_NEW_FENCE => create_new_fence(),
+                    IDM_SORT_UNSORTED => sort_unsorted_now(hwnd),
                     IDM_SETTINGS => launch::open_config_in_notepad(),
                     _ => {}
                 }
