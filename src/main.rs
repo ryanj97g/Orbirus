@@ -2,6 +2,7 @@
 // NOTE: #![windows_subsystem = "windows"] is intentionally absent until M7 —
 // keep the console during development for println! debugging.
 
+mod config;
 mod fence;
 mod render;
 
@@ -55,9 +56,34 @@ fn main() -> Result<()> {
 
         add_tray_icon(hwnd)?;
 
-        // M1: one hardcoded fence to prove desktop-layer pinning + rendering.
+        // M3: fences come from config; first run creates the default
+        // ("Unsorted") config and shows the §2 setup instruction once.
+        let load_result = config::load();
+        let first_run = matches!(load_result, config::LoadResult::Missing);
+        let cfg = match load_result {
+            config::LoadResult::Loaded(c) => c,
+            _ => config::Config::default(),
+        };
+        config::init(cfg, hwnd);
+        if first_run {
+            config::save_now();
+        }
+
         fence::register_class(hinstance)?;
-        fence::create_fence(hinstance, "New Fence", 100, 80, 420, 300)?;
+        let fence_cfgs = config::with(|c| c.fences.clone());
+        for fc in &fence_cfgs {
+            fence::create_fence(hinstance, fc)?;
+        }
+        println!("Loaded {} fence(s) from config.", fence_cfgs.len());
+
+        if first_run {
+            MessageBoxW(
+                hwnd,
+                w!("Orbirus shows your desktop items inside fences. To avoid seeing everything twice, hide Windows' own desktop icons:\n\nRight-click the desktop \u{2192} View \u{2192} uncheck \"Show desktop icons\"."),
+                w!("Orbirus"),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
 
         println!("Orbirus running. (This console is for development only — you don't need to do anything here.)");
 
@@ -132,7 +158,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            WM_TIMER => {
+                if wparam.0 == config::SAVE_TIMER_ID {
+                    let _ = KillTimer(hwnd, config::SAVE_TIMER_ID);
+                    config::save_now();
+                }
+                LRESULT(0)
+            }
             WM_DESTROY => {
+                // Flush any pending debounced save so the last mutation wins.
+                config::save_now();
                 remove_tray_icon(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)

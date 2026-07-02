@@ -8,11 +8,15 @@ use std::ffi::c_void;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, EnumDisplayMonitors, InvalidateRect, MonitorFromWindow, HDC, HMONITOR,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::config::{self, FenceConfig};
 use crate::render::{self, FenceRenderer};
 
 const FENCE_CLASS: PCWSTR = w!("OrbirusFence");
@@ -20,6 +24,7 @@ const RESIZE_BAND: i32 = 8; // physical px, per spec §7
 const MIN_FENCE_WIDTH: i32 = 120;
 
 pub struct FenceState {
+    pub id: String,
     pub title: String,
     pub color: D2D1_COLOR_F,
     pub opacity: f32,
@@ -38,6 +43,16 @@ pub fn color_from_hex(hex: u32) -> D2D1_COLOR_F {
     }
 }
 
+/// Parses "#RRGGBB"; falls back to the default fence color on bad input.
+pub fn parse_color(s: &str) -> D2D1_COLOR_F {
+    let hex = s
+        .strip_prefix('#')
+        .and_then(|v| u32::from_str_radix(v, 16).ok())
+        .filter(|_| s.len() == 7)
+        .unwrap_or(0x1E1E2E);
+    color_from_hex(hex)
+}
+
 pub unsafe fn register_class(hinstance: HINSTANCE) -> Result<()> {
     let wc = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
@@ -53,25 +68,19 @@ pub unsafe fn register_class(hinstance: HINSTANCE) -> Result<()> {
     Ok(())
 }
 
-pub unsafe fn create_fence(
-    hinstance: HINSTANCE,
-    title: &str,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> Result<HWND> {
+pub unsafe fn create_fence(hinstance: HINSTANCE, cfg: &FenceConfig) -> Result<HWND> {
     let state = Box::new(FenceState {
-        title: title.to_string(),
-        color: color_from_hex(0x1E1E2E),
-        opacity: 0.78,
-        corner_radius: 12.0,
-        rolled_up: false,
-        restore_height: h,
+        id: cfg.id.clone(),
+        title: cfg.title.clone(),
+        color: parse_color(&cfg.color),
+        opacity: cfg.opacity,
+        corner_radius: cfg.corner_radius,
+        rolled_up: cfg.rolled_up,
+        restore_height: cfg.h,
         renderer: None,
     });
 
-    let mut title_utf16: Vec<u16> = title.encode_utf16().collect();
+    let mut title_utf16: Vec<u16> = cfg.title.encode_utf16().collect();
     title_utf16.push(0);
 
     // WS_THICKFRAME makes DefWindowProc run the system resize loop for our
@@ -82,10 +91,10 @@ pub unsafe fn create_fence(
         FENCE_CLASS,
         PCWSTR(title_utf16.as_ptr()),
         WS_POPUP | WS_THICKFRAME,
-        x,
-        y,
-        w,
-        h,
+        cfg.x,
+        cfg.y,
+        cfg.w,
+        cfg.h,
         None,
         None,
         hinstance,
@@ -93,6 +102,17 @@ pub unsafe fn create_fence(
     )?;
 
     SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
+    if cfg.rolled_up {
+        SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            0,
+            0,
+            cfg.w,
+            titlebar_height_px(hwnd),
+            SWP_NOMOVE | SWP_NOACTIVATE,
+        )?;
+    }
     SetWindowPos(
         hwnd,
         HWND_BOTTOM,
@@ -104,6 +124,62 @@ pub unsafe fn create_fence(
     )?;
 
     Ok(hwnd)
+}
+
+unsafe fn monitor_index(hwnd: HWND) -> u32 {
+    unsafe extern "system" fn collect(
+        mon: HMONITOR,
+        _dc: HDC,
+        _rc: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let list = &mut *(lparam.0 as *mut Vec<isize>);
+        list.push(mon.0 as isize);
+        TRUE
+    }
+    let target = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut monitors: Vec<isize> = Vec::new();
+    let _ = EnumDisplayMonitors(
+        None,
+        None,
+        Some(collect),
+        LPARAM(&mut monitors as *mut _ as isize),
+    );
+    monitors
+        .iter()
+        .position(|&m| m == target.0 as isize)
+        .unwrap_or(0) as u32
+}
+
+/// Mirrors the window's current geometry into the live config; schedules a
+/// debounced save only when something actually changed.
+unsafe fn sync_to_config(hwnd: HWND) {
+    let Some(state) = state_mut(hwnd) else { return };
+    let mut rc = RECT::default();
+    if GetWindowRect(hwnd, &mut rc).is_err() {
+        return;
+    }
+    // A rolled-up fence keeps its restored height in config.
+    let h = if state.rolled_up {
+        state.restore_height
+    } else {
+        rc.bottom - rc.top
+    };
+    let monitor = monitor_index(hwnd);
+    let changed = config::with(|cfg| {
+        let Some(f) = cfg.fences.iter_mut().find(|f| f.id == state.id) else {
+            return false;
+        };
+        let new = (rc.left, rc.top, rc.right - rc.left, h, state.rolled_up, monitor);
+        if new == (f.x, f.y, f.w, f.h, f.rolled_up, f.monitor) {
+            return false;
+        }
+        (f.x, f.y, f.w, f.h, f.rolled_up, f.monitor) = new;
+        true
+    });
+    if changed {
+        config::schedule_save();
+    }
 }
 
 unsafe fn state_mut(hwnd: HWND) -> Option<&'static mut FenceState> {
@@ -219,6 +295,12 @@ extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 LRESULT(0)
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            // Layout mutations (move/resize/roll-up) flow into the config
+            // here. DefWindowProc still runs so WM_SIZE/WM_MOVE are generated.
+            WM_WINDOWPOSCHANGED => {
+                sync_to_config(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_ERASEBKGND => LRESULT(1),
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
