@@ -2,26 +2,42 @@
 // M1: creation, HWND_BOTTOM pinning via WM_WINDOWPOSCHANGING, painting.
 // M2: move (title-bar drag), resize (8px border band), roll-up (double-click
 // title bar).
+// M3: geometry syncs into config on WM_WINDOWPOSCHANGED.
+// M4: icon grid hit-testing, double-click launches items.
+// M5: icon drag between/within fences (ghost cursor), right-click title bar
+// menu with Delete fence; id->hwnd registry so fences can repaint each other.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, EnumDisplayMonitors, InvalidateRect, MonitorFromWindow, HDC, HMONITOR,
-    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, EndPaint, EnumDisplayMonitors, InvalidateRect, MonitorFromWindow,
+    ScreenToClient, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{self, FenceConfig};
+use crate::icons;
 use crate::render::{self, FenceRenderer};
 
 const FENCE_CLASS: PCWSTR = w!("OrbirusFence");
 const RESIZE_BAND: i32 = 8; // physical px, per spec §7
 const MIN_FENCE_WIDTH: i32 = 120;
+const IDM_FENCE_DELETE: usize = 100;
+
+struct DragState {
+    path: String,
+    start: POINT, // client px
+    active: bool,
+    cursor: Option<HCURSOR>,
+}
 
 pub struct FenceState {
     pub id: String,
@@ -32,6 +48,17 @@ pub struct FenceState {
     pub rolled_up: bool,
     pub restore_height: i32,
     renderer: Option<FenceRenderer>,
+    drag: Option<DragState>,
+}
+
+thread_local! {
+    // fence id -> HWND, so any fence can invalidate another (drop targets,
+    // items returning to Unsorted).
+    static REGISTRY: RefCell<HashMap<String, isize>> = RefCell::new(HashMap::new());
+}
+
+pub fn hwnd_for(id: &str) -> Option<HWND> {
+    REGISTRY.with(|r| r.borrow().get(id).map(|&h| HWND(h as *mut _)))
 }
 
 pub fn color_from_hex(hex: u32) -> D2D1_COLOR_F {
@@ -78,6 +105,7 @@ pub unsafe fn create_fence(hinstance: HINSTANCE, cfg: &FenceConfig) -> Result<HW
         rolled_up: cfg.rolled_up,
         restore_height: cfg.h,
         renderer: None,
+        drag: None,
     });
 
     let mut title_utf16: Vec<u16> = cfg.title.encode_utf16().collect();
@@ -100,6 +128,8 @@ pub unsafe fn create_fence(hinstance: HINSTANCE, cfg: &FenceConfig) -> Result<HW
         hinstance,
         Some(Box::into_raw(state) as *const c_void),
     )?;
+
+    REGISTRY.with(|r| r.borrow_mut().insert(cfg.id.clone(), hwnd.0 as isize));
 
     SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
     if cfg.rolled_up {
@@ -124,6 +154,73 @@ pub unsafe fn create_fence(hinstance: HINSTANCE, cfg: &FenceConfig) -> Result<HW
     )?;
 
     Ok(hwnd)
+}
+
+unsafe fn state_mut(hwnd: HWND) -> Option<&'static mut FenceState> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FenceState;
+    ptr.as_mut()
+}
+
+unsafe fn titlebar_height_px(hwnd: HWND) -> i32 {
+    let dpi = GetDpiForWindow(hwnd) as f32;
+    (render::TITLEBAR_HEIGHT * dpi / 96.0).round() as i32
+}
+
+/// The fence's items and the global icon size, straight from config.
+unsafe fn fence_items(id: &str) -> (Vec<String>, f32) {
+    config::with(|c| {
+        let items = c
+            .fences
+            .iter()
+            .find(|f| f.id == id)
+            .map(|f| f.items.clone())
+            .unwrap_or_default();
+        (items, c.icon_size as f32)
+    })
+}
+
+/// Grid cell index under a client-space point, or None outside the grid.
+unsafe fn icon_index_at(hwnd: HWND, id: &str, client_x: i32, client_y: i32) -> Option<usize> {
+    let to_dip = 96.0 / GetDpiForWindow(hwnd) as f32;
+    let mut rc = RECT::default();
+    GetClientRect(hwnd, &mut rc).ok()?;
+    let (items, icon_size) = fence_items(id);
+    let metrics = render::grid_metrics((rc.right - rc.left) as f32 * to_dip, icon_size);
+    let i = metrics.index_at(client_x as f32 * to_dip, client_y as f32 * to_dip)?;
+    (i < items.len()).then_some(i)
+}
+
+unsafe fn toggle_rollup(hwnd: HWND) {
+    let mut rc = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut rc);
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    let Some(state) = state_mut(hwnd) else { return };
+
+    if state.rolled_up {
+        state.rolled_up = false;
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            0,
+            0,
+            w,
+            state.restore_height,
+            SWP_NOMOVE | SWP_NOACTIVATE,
+        );
+    } else {
+        state.rolled_up = true;
+        state.restore_height = h;
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            0,
+            0,
+            w,
+            titlebar_height_px(hwnd),
+            SWP_NOMOVE | SWP_NOACTIVATE,
+        );
+    }
 }
 
 unsafe fn monitor_index(hwnd: HWND) -> u32 {
@@ -182,47 +279,164 @@ unsafe fn sync_to_config(hwnd: HWND) {
     }
 }
 
-unsafe fn state_mut(hwnd: HWND) -> Option<&'static mut FenceState> {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FenceState;
-    ptr.as_mut()
+/// The fence window (any fence, including the source) under a screen point.
+unsafe fn fence_at_point(pt: POINT) -> Option<(String, HWND)> {
+    REGISTRY.with(|r| {
+        for (id, &h) in r.borrow().iter() {
+            let hwnd = HWND(h as *mut _);
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_ok()
+                && pt.x >= rc.left
+                && pt.x < rc.right
+                && pt.y >= rc.top
+                && pt.y < rc.bottom
+            {
+                return Some((id.clone(), hwnd));
+            }
+        }
+        None
+    })
 }
 
-unsafe fn titlebar_height_px(hwnd: HWND) -> i32 {
-    let dpi = GetDpiForWindow(hwnd) as f32;
-    (render::TITLEBAR_HEIGHT * dpi / 96.0).round() as i32
-}
-
-unsafe fn toggle_rollup(hwnd: HWND) {
-    let mut rc = RECT::default();
-    let _ = GetWindowRect(hwnd, &mut rc);
-    let w = rc.right - rc.left;
-    let h = rc.bottom - rc.top;
-    let Some(state) = state_mut(hwnd) else { return };
-
-    if state.rolled_up {
-        state.rolled_up = false;
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_BOTTOM,
-            0,
-            0,
-            w,
-            state.restore_height,
-            SWP_NOMOVE | SWP_NOACTIVATE,
-        );
-    } else {
-        state.rolled_up = true;
-        state.restore_height = h;
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_BOTTOM,
-            0,
-            0,
-            w,
-            titlebar_height_px(hwnd),
-            SWP_NOMOVE | SWP_NOACTIVATE,
-        );
+unsafe fn end_drag_cursor(cursor: Option<HCURSOR>) {
+    if let Some(cur) = cursor {
+        if let Ok(arrow) = LoadCursorW(None, IDC_ARROW) {
+            SetCursor(arrow);
+        }
+        let _ = DestroyCursor(cur);
     }
+}
+
+/// Drop the dragged item at a screen point: reorder within the source fence,
+/// or reassign into another fence (at the drop cell when it's inside the
+/// grid, else appended). Anywhere else is a no-op — the icon snaps back.
+unsafe fn complete_drop(src_hwnd: HWND, src_id: &str, drag: &DragState, screen_pt: POINT) {
+    let Some((target_id, target_hwnd)) = fence_at_point(screen_pt) else {
+        return;
+    };
+    let mut cpt = screen_pt;
+    let _ = ScreenToClient(target_hwnd, &mut cpt);
+    let to_dip = 96.0 / GetDpiForWindow(target_hwnd) as f32;
+    let mut rc = RECT::default();
+    let _ = GetClientRect(target_hwnd, &mut rc);
+    let icon_size = config::with(|c| c.icon_size as f32);
+    let metrics = render::grid_metrics((rc.right - rc.left) as f32 * to_dip, icon_size);
+    let drop_idx = metrics.index_at(cpt.x as f32 * to_dip, cpt.y as f32 * to_dip);
+
+    let changed = config::with(|cfg| {
+        if src_id == target_id {
+            let Some(f) = cfg.fences.iter_mut().find(|f| f.id == src_id) else {
+                return false;
+            };
+            let Some(from) = f.items.iter().position(|p| p == &drag.path) else {
+                return false;
+            };
+            let Some(di) = drop_idx else { return false };
+            let to = di.min(f.items.len().saturating_sub(1));
+            if to == from {
+                return false;
+            }
+            let item = f.items.remove(from);
+            f.items.insert(to.min(f.items.len()), item);
+            true
+        } else {
+            let Some(sf) = cfg.fences.iter_mut().find(|f| f.id == src_id) else {
+                return false;
+            };
+            let Some(from) = sf.items.iter().position(|p| p == &drag.path) else {
+                return false;
+            };
+            let item = sf.items.remove(from);
+            let Some(tf) = cfg.fences.iter_mut().find(|f| f.id == target_id) else {
+                return false;
+            };
+            match drop_idx {
+                Some(di) if di < tf.items.len() => tf.items.insert(di, item),
+                _ => tf.items.push(item),
+            }
+            true
+        }
+    });
+    if changed {
+        config::schedule_save();
+        let _ = InvalidateRect(src_hwnd, None, false);
+        let _ = InvalidateRect(target_hwnd, None, false);
+    }
+}
+
+/// Right-click title-bar menu. Delete is disabled for an "Unsorted" fence
+/// that still holds items (§5) — everything else deletes, items returning
+/// to Unsorted.
+unsafe fn show_fence_menu(hwnd: HWND) {
+    let Some(state) = state_mut(hwnd) else { return };
+    let deletable = config::with(|cfg| {
+        cfg.fences
+            .iter()
+            .find(|f| f.id == state.id)
+            .map(|f| f.title != "Unsorted" || f.items.is_empty())
+            .unwrap_or(false)
+    });
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let flags = if deletable {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    };
+    let _ = AppendMenuW(menu, flags, IDM_FENCE_DELETE, w!("Delete fence"));
+
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    // Required for the menu to dismiss properly on a WS_EX_NOACTIVATE window.
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        None,
+    );
+    let _ = DestroyMenu(menu);
+    if cmd.0 as usize == IDM_FENCE_DELETE {
+        delete_fence(hwnd);
+    }
+}
+
+unsafe fn delete_fence(hwnd: HWND) {
+    let Some(state) = state_mut(hwnd) else { return };
+    let id = state.id.clone();
+    // Some(receiver): deleted; receiver is the Unsorted id if items moved.
+    let outcome = config::with(|cfg| {
+        let idx = cfg.fences.iter().position(|f| f.id == id)?;
+        if cfg.fences[idx].title == "Unsorted" && !cfg.fences[idx].items.is_empty() {
+            return None;
+        }
+        let removed = cfg.fences.remove(idx);
+        if removed.items.is_empty() {
+            return Some(None);
+        }
+        let u = config::ensure_unsorted(cfg);
+        cfg.fences[u].items.extend(removed.items);
+        Some(Some(cfg.fences[u].id.clone()))
+    });
+    let Some(receiver) = outcome else { return };
+    config::schedule_save();
+    if let Some(uid) = receiver {
+        match hwnd_for(&uid) {
+            Some(h) => {
+                let _ = InvalidateRect(h, None, false);
+            }
+            None => {
+                // Unsorted was just created by ensure_unsorted: give it a window.
+                let fc = config::with(|c| c.fences.iter().find(|f| f.id == uid).cloned());
+                if let (Some(fc), Ok(hmodule)) = (fc, GetModuleHandleW(None)) {
+                    let _ = create_fence(hmodule.into(), &fc);
+                }
+            }
+        }
+    }
+    let _ = DestroyWindow(hwnd);
 }
 
 extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -272,11 +486,11 @@ extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 (*mmi).ptMinTrackSize.y = titlebar_height_px(hwnd);
                 LRESULT(0)
             }
-            // Title-bar drag moves the fence: hand the click to the system
-            // move loop as a caption drag (we're WS_POPUP, no real caption).
             WM_LBUTTONDOWN => {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 if y < titlebar_height_px(hwnd) {
+                    // Title-bar drag moves the fence via the system move loop.
                     let _ = ReleaseCapture();
                     SendMessageW(
                         hwnd,
@@ -284,13 +498,92 @@ extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         WPARAM(HTCAPTION as usize),
                         LPARAM(0),
                     );
+                } else if let Some(state) = state_mut(hwnd) {
+                    // Body click on an icon: candidate item drag. It only
+                    // becomes one after passing the system drag threshold,
+                    // so double-click launch still works.
+                    if let Some(i) = icon_index_at(hwnd, &state.id, x, y) {
+                        let (items, _) = fence_items(&state.id);
+                        if let Some(item) = items.get(i) {
+                            state.drag = Some(DragState {
+                                path: item.clone(),
+                                start: POINT { x, y },
+                                active: false,
+                                cursor: None,
+                            });
+                            SetCapture(hwnd);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                if let Some(state) = state_mut(hwnd) {
+                    if let Some(drag) = &mut state.drag {
+                        let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                        let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                        if !drag.active
+                            && ((x - drag.start.x).abs() > GetSystemMetrics(SM_CXDRAG)
+                                || (y - drag.start.y).abs() > GetSystemMetrics(SM_CYDRAG))
+                        {
+                            drag.active = true;
+                            drag.cursor = icons::drag_cursor(&drag.path);
+                        }
+                        if drag.active {
+                            if let Some(cur) = drag.cursor {
+                                SetCursor(cur);
+                            }
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                let taken = state_mut(hwnd).and_then(|s| s.drag.take());
+                if let Some(drag) = taken {
+                    let _ = ReleaseCapture();
+                    if drag.active {
+                        end_drag_cursor(drag.cursor);
+                        let mut pt = POINT {
+                            x: (lparam.0 & 0xFFFF) as i16 as i32,
+                            y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                        };
+                        let _ = ClientToScreen(hwnd, &mut pt);
+                        if let Some(state) = state_mut(hwnd) {
+                            let src_id = state.id.clone();
+                            complete_drop(hwnd, &src_id, &drag, pt);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                if let Some(state) = state_mut(hwnd) {
+                    if let Some(drag) = state.drag.take() {
+                        end_drag_cursor(drag.cursor);
+                    }
                 }
                 LRESULT(0)
             }
             WM_LBUTTONDBLCLK => {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
                 if y < titlebar_height_px(hwnd) {
                     toggle_rollup(hwnd);
+                } else if let Some(state) = state_mut(hwnd) {
+                    if let Some(i) = icon_index_at(hwnd, &state.id, x, y) {
+                        let (items, _) = fence_items(&state.id);
+                        if let Some(item) = items.get(i) {
+                            crate::launch::launch(item);
+                        }
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_RBUTTONUP => {
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                if y < titlebar_height_px(hwnd) {
+                    show_fence_menu(hwnd);
                 }
                 LRESULT(0)
             }
@@ -310,12 +603,15 @@ extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                         state.renderer = FenceRenderer::new(hwnd).ok();
                     }
                     if let Some(renderer) = &state.renderer {
+                        let (items, icon_size) = fence_items(&state.id);
                         let ok = renderer
                             .draw(
                                 &state.title,
                                 state.color,
                                 state.opacity,
                                 state.corner_radius,
+                                &items,
+                                icon_size,
                             )
                             .is_ok();
                         if !ok {
@@ -363,7 +659,8 @@ extern "system" fn fence_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: L
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut FenceState;
                 if !ptr.is_null() {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    drop(Box::from_raw(ptr));
+                    let state = Box::from_raw(ptr);
+                    REGISTRY.with(|r| r.borrow_mut().remove(&state.id));
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

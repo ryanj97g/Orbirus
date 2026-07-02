@@ -61,6 +61,43 @@ impl Default for Config {
     }
 }
 
+/// Next unused "fence-N" id. Takes &Config so it can be used inside a
+/// `with` closure without re-entrant borrowing.
+pub fn next_id_for(cfg: &Config) -> String {
+    let n = cfg
+        .fences
+        .iter()
+        .filter_map(|f| f.id.strip_prefix("fence-")?.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    format!("fence-{n}")
+}
+
+/// Index of the "Unsorted" fence, creating it with default geometry if it
+/// doesn't exist.
+pub fn ensure_unsorted(cfg: &mut Config) -> usize {
+    if let Some(i) = cfg.fences.iter().position(|f| f.title == "Unsorted") {
+        return i;
+    }
+    let id = next_id_for(cfg);
+    cfg.fences.push(FenceConfig {
+        id,
+        title: "Unsorted".to_string(),
+        x: 100,
+        y: 80,
+        w: 420,
+        h: 300,
+        monitor: 0,
+        rolled_up: false,
+        color: "#1E1E2E".to_string(),
+        opacity: 0.78,
+        corner_radius: 12.0,
+        items: Vec::new(),
+    });
+    cfg.fences.len() - 1
+}
+
 pub enum LoadResult {
     Loaded(Config),
     Missing,

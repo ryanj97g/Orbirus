@@ -3,20 +3,30 @@
 // keep the console during development for println! debugging.
 
 mod config;
+mod desktop;
 mod fence;
+mod icons;
+mod launch;
 mod render;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::*;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // WM_APP + 1 is reserved for desktop-change notifications (M7 file watcher).
 const WM_TRAYICON: u32 = WM_APP + 2;
 const IDM_EXIT: usize = 1;
+const IDM_NEW_FENCE: usize = 2;
+const IDM_SETTINGS: usize = 3;
 const TRAY_UID: u32 = 1;
 
 fn main() -> Result<()> {
@@ -65,9 +75,23 @@ fn main() -> Result<()> {
             _ => config::Config::default(),
         };
         config::init(cfg, hwnd);
-        if first_run {
+
+        // M4: everything on the real Desktop folders appears exactly once;
+        // unassigned items land in "Unsorted".
+        let desktop_items = desktop::enumerate();
+        let changed = desktop::reconcile(&desktop_items);
+        if first_run || changed {
             config::save_now();
         }
+        println!("Desktop items: {}", desktop_items.len());
+
+        // Extract all icons up front (never during paint), at the configured
+        // size scaled to this monitor's DPI.
+        let all_items: Vec<String> =
+            config::with(|c| c.fences.iter().flat_map(|f| f.items.iter().cloned()).collect());
+        let icon_px = config::with(|c| c.icon_size) * GetDpiForWindow(hwnd) / 96;
+        icons::preload(&all_items, icon_px);
+        println!("Cached icons for {} item(s).", all_items.len());
 
         fence::register_class(hinstance)?;
         let fence_cfgs = config::with(|c| c.fences.clone());
@@ -96,6 +120,38 @@ fn main() -> Result<()> {
         CoUninitialize();
         Ok(())
     }
+}
+
+/// Tray "New Fence": a 300x200 fence centered on the cursor's monitor.
+unsafe fn create_new_fence() {
+    let Ok(hmodule) = GetModuleHandleW(None) else {
+        return;
+    };
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = GetMonitorInfoW(hmon, &mut mi);
+    let fc = config::FenceConfig {
+        id: config::with(|c| config::next_id_for(c)),
+        title: "New Fence".to_string(),
+        x: (mi.rcWork.left + mi.rcWork.right) / 2 - 150,
+        y: (mi.rcWork.top + mi.rcWork.bottom) / 2 - 100,
+        w: 300,
+        h: 200,
+        monitor: 0,
+        rolled_up: false,
+        color: "#1E1E2E".to_string(),
+        opacity: 0.78,
+        corner_radius: 12.0,
+        items: Vec::new(),
+    };
+    config::with(|c| c.fences.push(fc.clone()));
+    config::schedule_save();
+    let _ = fence::create_fence(hmodule.into(), &fc);
 }
 
 unsafe fn add_tray_icon(hwnd: HWND) -> Result<()> {
@@ -131,6 +187,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
+    let _ = AppendMenuW(menu, MF_STRING, IDM_NEW_FENCE, w!("New Fence"));
+    let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS, w!("Settings…"));
     let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("Exit"));
 
     let mut pt = POINT::default();
@@ -153,8 +211,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_COMMAND => {
-                if wparam.0 & 0xFFFF == IDM_EXIT {
-                    let _ = DestroyWindow(hwnd);
+                match wparam.0 & 0xFFFF {
+                    IDM_EXIT => {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    IDM_NEW_FENCE => create_new_fence(),
+                    IDM_SETTINGS => launch::open_config_in_notepad(),
+                    _ => {}
                 }
                 LRESULT(0)
             }

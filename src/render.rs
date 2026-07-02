@@ -2,7 +2,10 @@
 // One process-wide D2D factory + one DirectWrite factory (UI thread only);
 // per-fence, an ID2D1HwndRenderTarget wrapped in FenceRenderer.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::path::Path;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -13,7 +16,88 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
+use crate::icons;
+
 pub const TITLEBAR_HEIGHT: f32 = 28.0; // DIPs
+
+/// Icon grid geometry, all in DIPs. Shared by drawing and hit-testing so a
+/// double-click always maps to the cell the user sees.
+pub struct GridMetrics {
+    pub pad: f32,
+    pub cell_w: f32,
+    pub cell_h: f32,
+    pub cols: usize,
+    pub top: f32,
+}
+
+pub fn grid_metrics(width_dips: f32, icon_size: f32) -> GridMetrics {
+    let pad = 10.0;
+    let cell_w = icon_size + 28.0;
+    let cell_h = icon_size + 22.0;
+    let cols = (((width_dips - 2.0 * pad) / cell_w).floor() as usize).max(1);
+    GridMetrics {
+        pad,
+        cell_w,
+        cell_h,
+        cols,
+        top: TITLEBAR_HEIGHT + 8.0,
+    }
+}
+
+impl GridMetrics {
+    pub fn cell_rect(&self, i: usize) -> D2D_RECT_F {
+        let row = i / self.cols;
+        let col = i % self.cols;
+        let left = self.pad + col as f32 * self.cell_w;
+        let top = self.top + row as f32 * self.cell_h;
+        D2D_RECT_F {
+            left,
+            top,
+            right: left + self.cell_w,
+            bottom: top + self.cell_h,
+        }
+    }
+
+    pub fn index_at(&self, x: f32, y: f32) -> Option<usize> {
+        if y < self.top || x < self.pad {
+            return None;
+        }
+        let col = ((x - self.pad) / self.cell_w) as usize;
+        if col >= self.cols {
+            return None;
+        }
+        let row = ((y - self.top) / self.cell_h) as usize;
+        Some(row * self.cols + col)
+    }
+}
+
+/// What the shell shows: .lnk/.url hide their extension, everything else
+/// keeps its full file name.
+fn display_name(path: &str) -> String {
+    let p = Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let name = match ext.as_deref() {
+        Some("lnk") | Some("url") => p.file_stem(),
+        _ => p.file_name(),
+    };
+    name.and_then(|n| n.to_str()).unwrap_or(path).to_string()
+}
+
+fn middle_truncate(name: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= max_chars || max_chars < 3 {
+        return name.to_string();
+    }
+    let keep = max_chars - 1;
+    let front = keep / 2 + keep % 2;
+    let back = keep / 2;
+    let head: String = chars[..front].iter().collect();
+    let tail: String = chars[chars.len() - back..].iter().collect();
+    format!("{head}\u{2026}{tail}")
+}
 
 thread_local! {
     static D2D_FACTORY: OnceCell<ID2D1Factory> = const { OnceCell::new() };
@@ -46,6 +130,11 @@ fn dwrite_factory() -> Result<IDWriteFactory> {
 pub struct FenceRenderer {
     target: ID2D1HwndRenderTarget,
     title_format: IDWriteTextFormat,
+    label_format: IDWriteTextFormat,
+    // ID2D1Bitmaps are per-render-target resources; each renderer creates its
+    // own from the shared CPU-side pixel cache in icons.rs. None = failed,
+    // don't retry every paint.
+    bitmaps: RefCell<HashMap<String, Option<ID2D1Bitmap>>>,
 }
 
 impl FenceRenderer {
@@ -90,9 +179,23 @@ impl FenceRenderer {
             title_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             title_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
 
+            let label_format = dwrite_factory()?.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                11.0,
+                w!("en-us"),
+            )?;
+            label_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            label_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+
             Ok(Self {
                 target,
                 title_format,
+                label_format,
+                bitmaps: RefCell::new(HashMap::new()),
             })
         }
     }
@@ -110,9 +213,47 @@ impl FenceRenderer {
         unsafe { self.target.SetDpi(dpi, dpi) };
     }
 
-    /// Draws the fence chrome: rounded-rect background (fence opacity baked
-    /// into the brush alpha), title bar strip, and title text.
-    pub fn draw(&self, title: &str, color: D2D1_COLOR_F, opacity: f32, radius: f32) -> Result<()> {
+    fn icon_bitmap(&self, path: &str) -> Option<ID2D1Bitmap> {
+        let mut cache = self.bitmaps.borrow_mut();
+        if let Some(entry) = cache.get(path) {
+            return entry.clone();
+        }
+        let bmp = icons::with_pixels(path, |px| unsafe {
+            self.target
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: px.size,
+                        height: px.size,
+                    },
+                    Some(px.bgra.as_ptr() as *const c_void),
+                    px.size * 4,
+                    &D2D1_BITMAP_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                    },
+                )
+                .ok()
+        })
+        .flatten();
+        cache.insert(path.to_string(), bmp.clone());
+        bmp
+    }
+
+    /// Draws the fence chrome (rounded-rect background with fence opacity in
+    /// the brush alpha, title bar strip, title text) and the icon grid.
+    pub fn draw(
+        &self,
+        title: &str,
+        color: D2D1_COLOR_F,
+        opacity: f32,
+        radius: f32,
+        items: &[String],
+        icon_size: f32,
+    ) -> Result<()> {
         unsafe {
             let t = &self.target;
             t.BeginDraw();
@@ -182,6 +323,48 @@ impl FenceRenderer {
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
+
+            // Icon grid: bitmap centered in each cell, label below,
+            // middle-truncated to the cell width.
+            let metrics = grid_metrics(size.width, icon_size);
+            let max_chars = (metrics.cell_w / 6.0) as usize;
+            for (i, item) in items.iter().enumerate() {
+                let cell = metrics.cell_rect(i);
+                if cell.top > size.height {
+                    break;
+                }
+                let icon_left = cell.left + (metrics.cell_w - icon_size) / 2.0;
+                let icon_rect = D2D_RECT_F {
+                    left: icon_left,
+                    top: cell.top,
+                    right: icon_left + icon_size,
+                    bottom: cell.top + icon_size,
+                };
+                if let Some(bmp) = self.icon_bitmap(item) {
+                    t.DrawBitmap(
+                        &bmp,
+                        Some(&icon_rect),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+                let label = middle_truncate(&display_name(item), max_chars);
+                let label_utf16: Vec<u16> = label.encode_utf16().collect();
+                t.DrawText(
+                    &label_utf16,
+                    &self.label_format,
+                    &D2D_RECT_F {
+                        left: cell.left - 2.0,
+                        top: icon_rect.bottom + 2.0,
+                        right: cell.right + 2.0,
+                        bottom: cell.bottom,
+                    },
+                    &text_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
 
             t.EndDraw(None, None)
         }
