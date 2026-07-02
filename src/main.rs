@@ -2,6 +2,9 @@
 // NOTE: #![windows_subsystem = "windows"] is intentionally absent until M7 —
 // keep the console during development for println! debugging.
 
+mod fence;
+mod render;
+
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
@@ -51,7 +54,12 @@ fn main() -> Result<()> {
         )?;
 
         add_tray_icon(hwnd)?;
-        println!("Orbirus running. Right-click the tray icon and choose Exit to quit.");
+
+        // M1: one hardcoded fence to prove desktop-layer pinning + rendering.
+        fence::register_class(hinstance)?;
+        fence::create_fence(hinstance, "New Fence", 100, 80, 420, 300)?;
+
+        println!("Orbirus running. (This console is for development only — you don't need to do anything here.)");
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).into() {
