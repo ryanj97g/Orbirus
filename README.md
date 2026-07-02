@@ -1,7 +1,6 @@
-<img width="1918" height="1078" alt="Screenshot 2026-07-02 153103" src="https://github.com/user-attachments/assets/b577586c-65bc-4638-8cd5-5a4a87b7974b" />
 # Orbirus
 
-**The executable is target/release/orbirus.exe. Debug builds keep a console for logging; release builds run without one.**
+<img width="1918" height="1078" alt="Screenshot 2026-07-02 153103" src="https://github.com/user-attachments/assets/b577586c-65bc-4638-8cd5-5a4a87b7974b" />
 
 A native Windows desktop organizer. Orbirus draws translucent, labeled panels — "fences" — on the desktop and groups your desktop icons inside them. The icons stay real desktop items; Orbirus only controls how they are grouped and shown. Written in Rust with Win32 and Direct2D — no Electron, no bundled runtime.
 
