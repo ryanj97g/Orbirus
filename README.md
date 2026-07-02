@@ -73,3 +73,7 @@ Settings live at `%APPDATA%\orbirus\config.json` — fence positions (physical p
 
 - Pure native Win32 with Direct2D/DirectWrite rendering. No web runtime and no background services.
 - Idle CPU is effectively 0%; memory use is a few tens of MB.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
