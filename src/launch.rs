@@ -22,20 +22,3 @@ pub fn launch(path: &str) {
         println!("launch failed ({}) for {path}", inst.0 as isize);
     }
 }
-
-/// Tray "Settings…" (v1): open config.json in Notepad.
-pub fn open_config_in_notepad() {
-    let path = crate::config::path();
-    let mut wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
-    wide.push(0);
-    unsafe {
-        ShellExecuteW(
-            None,
-            w!("open"),
-            w!("notepad.exe"),
-            PCWSTR(wide.as_ptr()),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-}
