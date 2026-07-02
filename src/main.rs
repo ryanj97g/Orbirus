@@ -16,7 +16,7 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTONULL,
+    MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -79,7 +79,12 @@ fn main() -> Result<()> {
         let first_run = matches!(load_result, config::LoadResult::Missing);
         let cfg = match load_result {
             config::LoadResult::Loaded(c) => c,
-            _ => config::Config::default(),
+            // M9: a truly absent config gets the five starter fences; the
+            // desktop::refresh below then distributes every item through
+            // their rules. A corrupt config must never re-fence — plain
+            // default (single Unsorted) instead.
+            config::LoadResult::Missing => first_run_config(),
+            config::LoadResult::Corrupt => config::Config::default(),
         };
         config::init(cfg, hwnd);
 
@@ -187,6 +192,66 @@ unsafe fn on_desktop_changed(hwnd: HWND) {
         }
     }
     fence::invalidate_all();
+}
+
+/// M9 first-run config: five starter fences laid out left-to-right from the
+/// top-left of the primary monitor, 420x300 with ~24px gaps, wrapping to a
+/// second row if they don't fit. Apps/Documents/Pictures/Folders each carry
+/// their category rule; Unsorted is the rule-less catch-all ("media" has no
+/// starter fence, so videos/music land there).
+unsafe fn first_run_config() -> config::Config {
+    let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = GetMonitorInfoW(hmon, &mut mi);
+
+    const STARTERS: [(&str, Option<&str>); 5] = [
+        ("Apps", Some("apps")),
+        ("Documents", Some("documents")),
+        ("Pictures", Some("pictures")),
+        ("Folders", Some("folders")),
+        ("Unsorted", None),
+    ];
+    let (w, h, gap) = (420, 300, 24);
+    let (x0, y0) = (mi.rcWork.left + gap, mi.rcWork.top + gap);
+    let (mut x, mut y) = (x0, y0);
+    let mut fences = Vec::new();
+    for (i, (title, category)) in STARTERS.iter().enumerate() {
+        if x + w > mi.rcWork.right {
+            x = x0;
+            y += h + gap;
+        }
+        fences.push(config::FenceConfig {
+            id: format!("fence-{}", i + 1),
+            title: title.to_string(),
+            x,
+            y,
+            w,
+            h,
+            monitor: 0,
+            rolled_up: false,
+            color: "#1E1E2E".to_string(),
+            opacity: 0.78,
+            corner_radius: 12.0,
+            items: Vec::new(),
+            rules: category
+                .map(|c| {
+                    vec![rules::Rule {
+                        kind: rules::RuleKind::Category,
+                        value: c.to_string(),
+                    }]
+                })
+                .unwrap_or_default(),
+        });
+        x += w + gap;
+    }
+    config::Config {
+        version: 2,
+        icon_size: 48,
+        fences,
+    }
 }
 
 /// Tray "Sort Unsorted now" (M8): run all rules against everything in
