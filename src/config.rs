@@ -141,7 +141,12 @@ pub fn load() -> LoadResult {
             LoadResult::Loaded(cfg)
         }
         Err(e) => {
+            // M10: never silently overwrite a layout the user might want
+            // back — park the unreadable file next to the fresh one.
             println!("config.json is unreadable ({e}); starting with defaults");
+            let bad = path().with_extension("json.bad");
+            let _ = fs::remove_file(&bad);
+            let _ = fs::rename(path(), &bad);
             LoadResult::Corrupt
         }
     }
@@ -152,6 +157,17 @@ pub fn load() -> LoadResult {
 pub fn init(cfg: Config, save_hwnd: HWND) {
     CURRENT.with(|c| *c.borrow_mut() = cfg);
     SAVE_HWND.with(|h| h.set(save_hwnd.0 as isize));
+}
+
+/// M12: swaps in a different config (layout restore) without touching the
+/// save-timer owner.
+pub fn replace(cfg: Config) {
+    CURRENT.with(|c| *c.borrow_mut() = cfg);
+}
+
+/// M12: directory holding layout snapshots.
+pub fn snapshots_dir() -> PathBuf {
+    path().parent().unwrap().join("snapshots")
 }
 
 pub fn with<R>(f: impl FnOnce(&mut Config) -> R) -> R {

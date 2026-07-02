@@ -49,6 +49,58 @@ fn ensure_cached(path: &str) {
     }
 }
 
+/// v1.2 "Sort by color": a sort key placing icons in rainbow hue order,
+/// with near-gray icons at the end (brightest first). Derived from the
+/// average of the icon's opaque pixels.
+pub fn rainbow_key(path: &str) -> (u8, u32) {
+    let avg = with_pixels(path, |px| {
+        let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+        for p in px.bgra.chunks_exact(4) {
+            let a = p[3] as u64;
+            if a > 40 {
+                // Un-premultiply back to straight color.
+                b += p[0] as u64 * 255 / a;
+                g += p[1] as u64 * 255 / a;
+                r += p[2] as u64 * 255 / a;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            None
+        } else {
+            Some(((r / n) as f32, (g / n) as f32, (b / n) as f32))
+        }
+    })
+    .flatten();
+    let Some((r, g, b)) = avg else {
+        return (2, 0); // no pixels at all: very last
+    };
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let v = max / 255.0;
+    let s = if max > 0.0 { (max - min) / max } else { 0.0 };
+    if s < 0.18 || v < 0.12 {
+        // Near-gray: after the rainbow, brightest first.
+        (1, (255.0 - max) as u32)
+    } else {
+        let d = max - min;
+        let hue = if max == r {
+            ((g - b) / d).rem_euclid(6.0)
+        } else if max == g {
+            (b - r) / d + 2.0
+        } else {
+            (r - g) / d + 4.0
+        };
+        (0, (hue * 1000.0) as u32)
+    }
+}
+
+/// M11: drop every cached extraction (icon size changed); call `preload`
+/// afterwards with the new pixel size.
+pub fn clear_cache() {
+    CACHE.with(|c| c.borrow_mut().clear());
+}
+
 pub fn with_pixels<R>(path: &str, f: impl FnOnce(&IconPixels) -> R) -> Option<R> {
     ensure_cached(path);
     CACHE.with(|c| c.borrow().get(path).and_then(|o| o.as_ref()).map(f))

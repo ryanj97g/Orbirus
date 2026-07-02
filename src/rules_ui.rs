@@ -12,8 +12,9 @@ use std::ffi::c_void;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE,
-    DEFAULT_CHARSET, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
+    CreateFontW, DeleteObject, GetMonitorInfoW, MonitorFromWindow, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, HBRUSH, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -104,13 +105,25 @@ pub unsafe fn open(fence_hwnd: HWND, fence_id: &str) {
     let mut frc = RECT::default();
     let _ = GetWindowRect(fence_hwnd, &mut frc);
     let (dw, dh) = (s(430), s(345));
+    // Clamp to the fence's monitor work area — fences near the top edge
+    // would otherwise push the dialog offscreen.
+    let hmon = MonitorFromWindow(fence_hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let _ = GetMonitorInfoW(hmon, &mut mi);
+    let dx = ((frc.left + frc.right) / 2 - dw / 2)
+        .clamp(mi.rcWork.left, (mi.rcWork.right - dw).max(mi.rcWork.left));
+    let dy = ((frc.top + frc.bottom) / 2 - dh / 2)
+        .clamp(mi.rcWork.top, (mi.rcWork.bottom - dh).max(mi.rcWork.top));
     let dlg = match CreateWindowExW(
         WS_EX_TOOLWINDOW,
         AUTOORG_CLASS,
-        w!("Auto-organize"),
+        w!("Sorting rules"),
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        (frc.left + frc.right) / 2 - dw / 2,
-        (frc.top + frc.bottom) / 2 - dh / 2,
+        dx,
+        dy,
         dw,
         dh,
         None,
